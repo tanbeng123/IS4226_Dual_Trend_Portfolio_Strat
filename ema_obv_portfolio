@@ -1,0 +1,770 @@
+# Import libraries
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings("ignore")
+
+import seaborn as sns
+
+plt.rcParams["figure.figsize"] = (12, 6)
+plt.rcParams["axes.grid"] = False
+plt.style.use("seaborn-v0_8-whitegrid")
+plt.rcParams["axes.edgecolor"] = "black"
+plt.rcParams["axes.linewidth"] = 1.0
+plt.rcParams["figure.dpi"] = 120
+
+
+
+# ==========================================================
+# Safe downloader (Close + Volume, handles single & MultiIndex)
+# ==========================================================
+def safe_download(tickers, start, end):
+    df = yf.download(
+        tickers, start=start, end=end,
+        progress=False, auto_adjust=True, group_by="ticker"
+    )
+    px, vol = pd.DataFrame(), pd.DataFrame()
+
+    # For multiple tickers - Dataframe is MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        for t in tickers:
+            if t in df.columns.get_level_values(0):
+                tdf = df[t]
+                if "Close" in tdf and "Volume" in tdf:
+                    px[t]  = tdf["Close"]
+                    vol[t] = tdf["Volume"]
+    else:
+        # For single ticker
+        if "Close" in df and "Volume" in df:
+            t = tickers[0]
+            px[t]  = df["Close"]
+            vol[t] = df["Volume"]
+
+    px.dropna(how="all", inplace=True)
+    vol.dropna(how="all", inplace=True)
+    px, vol = px.align(vol, join="inner", axis=0)
+    return px, vol
+
+
+# ==========================================================
+# Metrics / Benchmark / Attribution / Trades
+# ==========================================================
+# Calculate metrics for Total return, Compound annual growth rate CAGR, Sharpe, Sortino, Calmar, Max Drawdown
+def calc_metrics(daily_ret, equity, init_cap: float):
+    # Ensure daily_ret is a 1-D Series (equal-weight across cols if needed)
+    if isinstance(daily_ret, pd.DataFrame):
+        if daily_ret.shape[1] == 1:
+            daily_ret = daily_ret.iloc[:, 0]
+        else:
+            daily_ret = daily_ret.mean(axis=1)
+    daily_ret = daily_ret.dropna()
+
+    equity = equity.dropna()
+    total_ret = float(equity.iloc[-1] / init_cap - 1.0) if len(equity) else np.nan
+
+    days = len(equity)
+    if days >= 2:
+        cagr = float((equity.iloc[-1] / equity.iloc[0]) ** (252 / days) - 1.0)
+    else:
+        cagr = np.nan
+
+    # Force scalars
+    vol = float(daily_ret.std() * np.sqrt(252)) if len(daily_ret) > 1 else np.nan
+    mean_ann = float(daily_ret.mean() * 252) if len(daily_ret) else np.nan
+    sharpe = (mean_ann / vol) if (pd.notna(vol) and vol > 0) else np.nan
+
+    dd = float((equity / equity.cummax() - 1).min()) if len(equity) else np.nan
+    calmar = (cagr / abs(dd)) if (pd.notna(cagr) and pd.notna(dd) and dd < 0) else np.nan
+
+    dn = float(daily_ret[daily_ret < 0].std()) if len(daily_ret) else np.nan
+    sortino = (mean_ann / (dn * np.sqrt(252))) if (pd.notna(dn) and dn > 0) else np.nan
+
+    return dict(
+        Total_Return=total_ret, CAGR=cagr, Sharpe=sharpe,
+        Sortino=sortino, Calmar=calmar, MaxDD=dd,
+        Ann_Mean=mean_ann, Ann_Std_Dev=vol
+    )
+
+
+# Helper function: Compute maximum drawdown duration (in trading days)
+def max_drawdown_duration(equity: pd.Series) -> int:
+    """
+    Calculates the maximum number of consecutive days the portfolio remained under water.
+    """
+    dd = equity / equity.cummax() - 1
+    draw = (dd < 0).astype(int)
+    duration = draw.groupby((draw != draw.shift()).cumsum()).cumsum()
+    return int(duration.max())
+
+# Compare to SPY as benchmark, find Alpha, Beta, Information Ratio
+def benchmark_compare(portfolio_daily_ret, start, end, symbol="SPY"):
+    bench = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
+    bench_ret = bench["Close"].pct_change().dropna()
+    aligned = pd.concat([portfolio_daily_ret, bench_ret], axis=1).dropna()
+    aligned.columns = ["Portfolio", "Benchmark"]
+
+    if aligned["Benchmark"].var() > 0:
+        cov = np.cov(aligned["Portfolio"], aligned["Benchmark"])[0, 1]
+        beta = cov / aligned["Benchmark"].var()
+    else:
+        beta = np.nan
+
+    alpha = (aligned["Portfolio"].mean() * 252) - (0 if np.isnan(beta) else beta * aligned["Benchmark"].mean() * 252)
+
+    excess = aligned["Portfolio"] - aligned["Benchmark"]
+    ir = (excess.mean() / excess.std()) * np.sqrt(252) if excess.std() > 0 else np.nan
+
+    ann_return = aligned["Portfolio"].mean() * 252
+    treynor = (ann_return) / beta if (pd.notna(beta) and beta != 0) else np.nan
+
+    return alpha, beta, ir, treynor, aligned
+
+
+# Find individual stocks' contribution to performance (based on Returns & Sharpe)
+def per_ticker_attribution(price: pd.DataFrame, positions: pd.DataFrame):
+    """
+    Returns per ticker (column-wise):
+      - Return_Contribution: total multiplicative contribution minus 1
+      - Sharpe_Contribution: ticker-level Sharpe using its own active return stream
+    """
+    rets = price.pct_change()
+    strat = positions.shift(1) * rets  # per-ticker active P&L stream
+
+    # Multiplicative contribution per ticker
+    total_return_contrib = (1.0 + strat).cumprod().iloc[-1] - 1.0
+
+    # Ticker Sharpe
+    sharpe_contrib = (strat.mean() * 252) / (strat.std() * np.sqrt(252))
+
+    return pd.DataFrame({
+        "Return_Contribution": total_return_contrib,
+        "Sharpe_Contribution": sharpe_contrib
+    })
+
+
+# Plot individual stocks' contribution to performance (one chart for Sharpe and one for Return Contribution, then print attribution table)
+def plot_per_ticker_attribution(price: pd.DataFrame, positions: pd.DataFrame):
+    attr = per_ticker_attribution(price, positions).sort_values(
+        "Sharpe_Contribution", ascending=True
+    )
+    plt.figure(figsize=(10, 6))
+    plt.barh(attr.index, attr["Sharpe_Contribution"], color="steelblue")
+    plt.title("Per-Ticker Sharpe Contribution")
+    plt.xlabel("Sharpe Contribution")
+    plt.grid(axis="x", linestyle="--", alpha=0.5)
+    plt.show()
+
+    # Return contribution chart
+    plt.figure(figsize=(10, 5))
+    attr["Return_Contribution"].sort_values().plot(kind="barh", color="steelblue")
+    plt.title("Per-Ticker Return Contribution")
+    plt.xlabel("Contribution (Total)")
+    plt.grid(axis="x", linestyle="--", alpha=0.5)
+    plt.show()
+
+    print("\n=== Per-Ticker Attribution Table ===")
+    print(attr)
+
+
+# Determine the trades of each stock
+def extract_trades(positions: pd.Series, prices: pd.Series) -> pd.DataFrame:
+    """
+    For a single ticker's position series {-1,0,1} and price series,
+    return trades with Entry/Exit/Side/EntryPx/ExitPx/Return.
+    """
+    trades = []
+    pos = positions.fillna(0).astype(int)
+    change_idx = pos[pos != pos.shift(1)].index
+
+    for i, dt in enumerate(change_idx):
+        new = pos.loc[dt]
+        if new == 0:
+            continue
+        side = int(new)
+        entry_date = dt
+        entry_price = float(prices.loc[entry_date])
+
+        exit_date = change_idx[i + 1] if i + 1 < len(change_idx) else prices.index[-1]
+        exit_price = float(prices.loc[exit_date])
+
+        ret = (exit_price / entry_price - 1.0) * side
+        trades.append([entry_date, exit_date, side, entry_price, exit_price, ret])
+
+    return pd.DataFrame(trades, columns=["Entry", "Exit", "Side", "EntryPx", "ExitPx", "Return"])
+
+# Helper function: Aggregate trade statistics (count, win-rate, avg returns, expectancy)
+def trade_statistics(positions: pd.DataFrame, prices: pd.DataFrame) -> dict:
+    """
+    Aggregates total trade stats across all tickers:
+      - Total Trades
+      - Win Rate
+      - Average Win / Loss
+      - Expectancy (expected return per trade)
+    """
+    total_trades, wins, losses, returns = 0, 0, 0, []
+
+    for t in positions.columns:
+        trades = extract_trades(positions[t], prices[t])
+        if trades.empty:
+            continue
+        total_trades += len(trades)
+        trade_rets = trades["Return"].dropna()
+        returns.extend(trade_rets)
+        wins += (trade_rets > 0).sum()
+        losses += (trade_rets < 0).sum()
+
+    if total_trades == 0:
+        return {
+            "Total_Trades": 0,
+            "Win_Rate": np.nan,
+            "Avg_Win": np.nan,
+            "Avg_Loss": np.nan,
+            "Expectancy": np.nan
+        }
+
+    win_rate = wins / total_trades
+    avg_win = np.mean([r for r in returns if r > 0]) if wins > 0 else 0
+    avg_loss = np.mean([r for r in returns if r < 0]) if losses > 0 else 0
+    expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
+
+    return {
+        "Total_Trades": total_trades,
+        "Win_Rate": win_rate,
+        "Avg_Win": avg_win,
+        "Avg_Loss": avg_loss,
+        "Expectancy": expectancy
+    }
+
+# ==========================================================
+# Backtester (EMA-OBV + dual MA trend + target-vol scaling)
+# ==========================================================
+class EMA_OBV_Portfolio:
+    def __init__(self, tickers, start, end,
+                 initial_capital=500000,
+                 lambda_=0.990,
+                 weighted=False,                           # Default unweighted EMA OBV
+                 vol_window=30,
+                 ma_window=50,
+                 use_dual_ma=True,                         # Allow Primary confirmation gate 50/200 MA confirmation
+                 allow_divergence_near_cross=True,         # Allow secondary confirmation gate: Override dual MA trend signals for divergence signals if 50/200 Day MAs are close
+                 near_cross_tol=0.01,                      # Condition for secondary gate: 50/200 MAs are within 1% of price
+                 target_ann_vol=0.20,                      # Set target volatility for the portfolio as 0.20
+                 cost_per_turnover=0.0):
+        self.tickers = tickers
+        self.start, self.end = start, end
+        self.initial_capital = initial_capital
+        self.lambda_ = float(lambda_)
+        self.alpha = 1.0 - self.lambda_
+        self.weighted = bool(weighted)
+        self.vol_window = int(vol_window)
+        self.ma_window = int(ma_window)
+        self.use_dual_ma = bool(use_dual_ma)
+        self.allow_divergence_near_cross = bool(allow_divergence_near_cross)
+        self.near_cross_tol = float(near_cross_tol)
+        self.target_ann_vol = float(target_ann_vol)
+        self.cost_per_turnover = float(cost_per_turnover)
+
+        self.price = None
+        self.volume = None
+        self.obv = None
+        self.smoothed_obv = None
+        self.signals = None
+        self.positions = None
+        self.portfolio = None
+
+    # Loading Data
+    def load_data(self):
+        self.price, self.volume = safe_download(self.tickers, self.start, self.end)
+        return self.price, self.volume
+
+    # OBV (raw + EMA-smoothed) computation
+    def compute_obv_smoothed(self):
+        px, vol = self.price, self.volume
+        obv = pd.DataFrame(index=px.index, columns=px.columns, dtype=float)
+        sm  = pd.DataFrame(index=px.index, columns=px.columns, dtype=float)
+
+        for t in self.tickers:
+            if t not in px.columns:
+                continue
+            c = px[t].ffill()
+            v = vol[t].ffill()
+
+            if self.weighted:
+                w = c.diff() / c.shift(1)
+                raw = (w * v).cumsum()
+            else:
+                d = np.sign(c.diff()).fillna(0)
+                raw = (d * v).cumsum()
+
+            obv[t] = raw
+            sm[t]  = raw.ewm(alpha=self.alpha, adjust=False).mean()
+
+        self.obv, self.smoothed_obv = obv, sm
+        return obv, sm
+
+    # Signals (confirmation + dual-trend mask + gated divergence)
+    def generate_signals(self):
+        px, sm = self.price, self.smoothed_obv
+        sig = pd.DataFrame(0.0, index=px.index, columns=px.columns)
+
+        # daily direction signs
+        price_dir = px.diff().apply(np.sign)
+        obv_dir   = sm.diff().apply(np.sign)
+
+        for t in self.tickers:
+            if t not in px.columns:
+                continue
+
+            s = pd.Series(0.0, index=px.index)
+
+            # Generate initial signals: EMA OBV-Price
+            s.loc[(price_dir[t] > 0) & (obv_dir[t] > 0)] =  1.0
+            s.loc[(price_dir[t] < 0) & (obv_dir[t] < 0)] = -1.0
+            s.loc[(price_dir[t] < 0) & (obv_dir[t] > 0)] =  1.0
+            s.loc[(price_dir[t] > 0) & (obv_dir[t] < 0)] = -1.0
+
+            # Trend masks
+            ma_short = px[t].rolling(self.ma_window, min_periods=self.ma_window).mean()
+            trend_short_up   = px[t] > ma_short
+            trend_short_down = px[t] < ma_short
+
+            # Primary Confirmation Gate
+            if self.use_dual_ma: #If dual confirmation of 50/200 Day MA is required
+                ma_long = px[t].rolling(200, min_periods=200).mean()
+                trend_long_up   = px[t] > ma_long
+                trend_long_down = px[t] < ma_long
+
+                # STRICT dual confirmation: require both 50/200 Day MAs to agree
+                s = s.where(
+                    ((s == 1.0)  & trend_short_up  & trend_long_up) |
+                    ((s == -1.0) & trend_short_down & trend_long_down),
+                    0.0
+                )
+            else:# If Only MA50 confirmation
+                s = s.where(
+                    ((s == 1.0) & trend_short_up) |
+                    ((s == -1.0) & trend_short_down),
+                    0.0
+                )
+
+            # Secondary Confirmation Fate: gated divergence near MA(50)~MA(200) cross
+            if self.use_dual_ma and self.allow_divergence_near_cross:
+                ma_long = px[t].rolling(200, min_periods=200).mean()
+                near_cross = (ma_short - ma_long).abs() < (self.near_cross_tol * px[t])
+
+                # Recompute single-series dirs to avoid accidental frame alignment issues
+                pdir = px[t].diff().apply(np.sign)
+                odir = sm[t].diff().apply(np.sign)
+
+                # Override primary gate signals for initial divergence signals
+                bullish_div = (pdir < 0) & (odir > 0) & near_cross
+                bearish_div = (pdir > 0) & (odir < 0) & near_cross
+
+                s.loc[bullish_div] = 1.0
+                s.loc[bearish_div] = -1.0
+
+            sig[t] = s.fillna(0.0)
+
+        self.signals = sig
+        return sig
+
+    # Positions (hold-until-change + target vol scaling)
+    def build_positions(self):
+        pos = self.signals.replace(0, np.nan).ffill().fillna(0.0)
+
+        if self.vol_window and self.vol_window > 0:
+            rets = self.price.pct_change()
+            rolling_vol = rets.rolling(self.vol_window).std()
+            target = self.target_ann_vol / np.sqrt(252)
+            scale = (target / rolling_vol).clip(0.5, 2.0)
+            pos = pos * scale
+
+        self.positions = pos
+        return pos
+
+    # Portfolio (simple equal-weighting across active names)
+    def compute_portfolio(self):
+        rets = self.price.pct_change()
+        strat = self.positions.shift(1) * rets
+
+        active = strat.notna().sum(axis=1).replace(0, np.nan)
+        gross_ret = (strat.sum(axis=1) / active).fillna(0.0)
+
+        # simple transaction cost via turnover
+        turnover = (self.positions.diff().abs().sum(axis=1)
+                    / self.positions.notna().sum(axis=1)).fillna(0.0)
+        net_ret = gross_ret - self.cost_per_turnover * turnover
+
+        equity = (1.0 + net_ret).cumprod() * self.initial_capital
+        self.portfolio = pd.DataFrame({"daily_return": net_ret, "equity": equity})
+        return self.portfolio
+
+    # Run functions to compute portfolio
+    def run(self, price=None, volume=None):
+        if price is None or volume is None:
+            self.load_data()
+        else:
+            self.price, self.volume = price, volume
+        self.compute_obv_smoothed()
+        self.generate_signals()
+        self.build_positions()
+        return self.compute_portfolio()
+
+
+# ==========================================================
+# Walk-forward (expanding) + Expanding-window summary
+# ==========================================================
+def expanding_window_test(tickers, start, end, weighted,
+                        lambda_grid=(0.94, 0.97, 0.99, 0.995),
+                        volw_grid=(0, 30, 60, 120),
+                        ma_window=50,
+                        first_test_year=2012,
+                        cost_per_turnover=0.0,
+                        target_ann_vol=0.20,
+                        use_dual_ma=True,
+                        allow_divergence_near_cross=True):
+    price, volume = safe_download(tickers, start, end)
+    all_years = sorted({d.year for d in price.index})
+    test_years = [y for y in all_years if y >= first_test_year]
+
+    stitched_eq = pd.Series(dtype=float)
+    yearly_rows, param_rows = [], []
+
+    for y in test_years:
+        train_px = price.loc[:f"{y-1}-12-31"]
+        test_px  = price.loc[f"{y}-01-01":f"{y}-12-31"] #1 year testing period
+        if len(test_px) < 50:
+            continue
+
+        # Find best model based on performance on training data with grid search - Expanding window
+        best, best_sharpe = None, -1e9
+        for lam in lambda_grid: # Grid search on lambda values: (0.94, 0.97, 0.99, 0.995),
+            for vw in volw_grid: # Grid search on volatility-scaling windows: (0, 30, 60, 120)
+                bt = EMA_OBV_Portfolio(
+                    tickers, start, end,
+                    lambda_=lam, weighted=weighted, vol_window=vw,
+                    ma_window=ma_window, cost_per_turnover=cost_per_turnover,
+                    target_ann_vol=target_ann_vol,
+                    use_dual_ma=use_dual_ma,
+                    allow_divergence_near_cross=allow_divergence_near_cross
+                )
+                bt.run(price=train_px, volume=volume.loc[train_px.index])
+                m = calc_metrics(bt.portfolio["daily_return"], bt.portfolio["equity"], bt.initial_capital)
+                if pd.notna(m["Sharpe"]) and m["Sharpe"] > best_sharpe:
+                    best_sharpe = m["Sharpe"]
+                    best = (lam, vw)
+
+        lam_star, vw_star = best
+        param_rows.append({"Year": y, "Best_lambda": lam_star, "Best_vol_window": vw_star})
+
+        # Evaluate the best model on the Testing data - 1 year period after training data
+        bt_test = EMA_OBV_Portfolio(
+            tickers, start, end,
+            lambda_=lam_star, weighted=weighted, vol_window=vw_star,
+            ma_window=ma_window, cost_per_turnover=cost_per_turnover,
+            target_ann_vol=target_ann_vol,
+            use_dual_ma=use_dual_ma,
+            allow_divergence_near_cross=allow_divergence_near_cross
+        )
+        bt_test.run(price=price.loc[test_px.index.union(train_px.index)],
+                    volume=volume.loc[test_px.index.union(train_px.index)])
+
+        eq_year  = bt_test.portfolio.loc[test_px.index, "equity"]
+        ret_year = bt_test.portfolio.loc[test_px.index, "daily_return"]
+        metrics  = calc_metrics(ret_year, eq_year, bt_test.initial_capital)
+
+        yearly_rows.append({"Year": y, **metrics})
+        stitched_eq = pd.concat([stitched_eq, eq_year])
+
+    return pd.DataFrame(yearly_rows), stitched_eq, pd.DataFrame(param_rows)
+
+# ==========================================================
+# Plot utilities
+# ==========================================================
+def plot_equity_vs_benchmark(equity, start, end, label="Strategy"):
+    _, _, _, _, aligned = benchmark_compare(equity.pct_change().dropna(), start, end)
+    bench_eq = (1 + aligned["Benchmark"]).cumprod() * 500000
+    plt.figure(figsize=(12, 6))
+    plt.plot(equity.index, equity, label=label, color="black")
+    plt.plot(bench_eq.index, bench_eq, "--", color="grey", label="SPY Benchmark")
+    plt.title(f"{label} vs SPY Benchmark")
+    plt.ylabel("Equity ($)")
+    plt.legend()
+    plt.show()
+
+
+def plot_underwater(equity):
+    dd = equity / equity.cummax() - 1.0
+    plt.figure(figsize=(12, 4))
+    plt.fill_between(dd.index, dd, 0, color="#d62728", alpha=0.45)
+    plt.title("Underwater Drawdown")
+    plt.ylabel("Drawdown")
+    plt.show()
+
+
+def plot_yearly_segments(results_df, label="CAGR"):
+    plt.figure(figsize=(10, 5))
+    plt.bar(results_df["Year"], results_df["CAGR"] * 100, color="skyblue")
+    plt.title("Yearly CAGR (%)")
+    plt.xlabel("Year")
+    plt.ylabel("Return %")
+    plt.grid(True, axis="y")
+    plt.show()
+
+
+def performance_dashboard(portfolio_returns, equity, benchmark_returns=None, title_suffix=""):
+    log_ret = np.log1p(portfolio_returns)
+    cum_log = log_ret.cumsum()
+    drawdown = (equity / equity.cummax()) - 1.0
+
+    plt.figure(figsize=(18, 10))
+
+    # 1) Cumulative Log Returns
+    plt.subplot(2, 3, 1)
+    plt.plot(cum_log, color="black", label="Cumulative Log Returns")
+    plt.title("Cumulative Log Returns")
+    plt.xlabel("Date")
+    plt.ylabel("Log Return")
+    plt.legend()
+    plt.grid()
+
+    # 2) Histogram
+    plt.subplot(2, 3, 2)
+    plt.hist(portfolio_returns, bins=30, color="skyblue", edgecolor="black", alpha=0.7)
+    plt.title("Histogram of Daily Returns")
+    plt.xlabel("Daily Return")
+    plt.ylabel("Frequency")
+    plt.grid()
+
+    # 3) VS Benchmark
+    plt.subplot(2, 3, 3)
+    plt.plot((1 + portfolio_returns).cumprod(), label="Strategy", color="black")
+    if benchmark_returns is not None:
+        plt.plot((1 + benchmark_returns).cumprod(), label="SPY Benchmark", linestyle="--", color="grey")
+    plt.title("Strategy vs SPY Benchmark")
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative Return")
+    plt.legend()
+    plt.grid()
+
+    # 4) Drawdown
+    plt.subplot(2, 3, 4)
+    plt.fill_between(drawdown.index, drawdown, 0, color="red", alpha=0.3)
+    plt.plot(drawdown, color="red", linewidth=1.5)
+    plt.title("Drawdown")
+    plt.xlabel("Date")
+    plt.ylabel("Drawdown")
+    plt.grid()
+
+    # 5) Equity Curve
+    plt.subplot(2, 3, 5)
+    plt.plot(equity, color="green", label="Equity ($)")
+    plt.title("Portfolio Equity")
+    plt.xlabel("Date")
+    plt.ylabel("Equity ($)")
+    plt.legend()
+    plt.grid()
+
+    plt.suptitle(f"Performance Dashboard {title_suffix}", fontsize=15, weight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout()
+    plt.show()
+
+# Strategy vs Benchmark reporter (DataFrame + single chart)
+# ==========================================================
+def report_and_compare_performance(strat_equities: dict, start, end,
+                                   benchmark_symbol="SPY", init_cap=500000):
+    """
+    Build a metrics DataFrame for multiple strategies vs SPY and
+    draw a compact side-by-side bar chart with a secondary y-axis for % metrics.
+    Returns the metrics DataFrame (Total_Return, CAGR, Alpha, MaxDD already in %).
+    """
+    # Benchmark series
+    bench = yf.download(benchmark_symbol, start=start, end=end,
+                        progress=False, auto_adjust=True)
+    spy_ret = bench["Close"].pct_change().dropna()
+    spy_eq  = (1 + spy_ret).cumprod() * init_cap
+
+    rows = []
+    for name, eq in strat_equities.items():
+        dr = eq.pct_change().dropna()
+        m  = calc_metrics(dr, eq, init_cap)
+        # Ensure Series into benchmark_compare
+        a, b, ir, treynor, _ = benchmark_compare(dr.squeeze(), start, end, symbol=benchmark_symbol)
+        rows.append({"Strategy": name, **m, "Alpha": a, "Beta": b, "Info_Ratio": ir, "Treynor": treynor})
+
+    # Include SPY self-row (IR may be NaN vs itself; that's fine)
+    spy_m  = calc_metrics(spy_ret, spy_eq, init_cap)
+    spy_a, spy_b, spy_ir, spy_treynor, _ = benchmark_compare(spy_ret, start, end, symbol=benchmark_symbol)
+    rows.append({"Strategy": f"{benchmark_symbol} (Benchmark)", **spy_m,
+                 "Alpha": spy_a, "Beta": spy_b, "Info_Ratio": spy_ir, "Treynor": spy_treynor})
+
+    df = pd.DataFrame(rows).set_index("Strategy")
+
+    # ----- Plot grouped bars: ratios on left y-axis, % metrics on right -----
+    ratio_metrics = ["Sharpe", "Sortino", "Calmar", "Info_Ratio", "Treynor", "Beta"]
+    pct_metrics   = ["Total_Return", "CAGR", "Alpha", "MaxDD", "Ann_Mean", "Ann_Std_Dev"]
+
+    cat_labels = ratio_metrics + pct_metrics
+    x = np.arange(len(cat_labels))
+    strategies = list(df.index)
+    n = len(strategies)
+    bar_w = 0.8 / max(n, 1)
+
+    fig, ax1 = plt.subplots(figsize=(14, 6))
+    ax2 = ax1.twinx()
+
+    for i, s in enumerate(strategies):
+        offset = (i - (n - 1) / 2) * bar_w
+
+        left_vals  = [float(df.loc[s, m]) if pd.notna(df.loc[s, m]) else np.nan for m in ratio_metrics]
+        right_vals = [float(df.loc[s, m] * 100) if pd.notna(df.loc[s, m]) else np.nan for m in pct_metrics]
+
+        ax1.bar(x[:len(ratio_metrics)] + offset, left_vals, width=bar_w, label=s)
+        ax2.bar(x[len(ratio_metrics):] + offset, right_vals, width=bar_w)
+
+    ax1.set_ylabel("Ratios (Sharpe / Sortino / Calmar / IR / Treynor / Beta)")
+    ax2.set_ylabel("Percent Metrics (%)  [Total Return, CAGR, Alpha, MaxDD, Ann_Mean, Ann_Std_Dev]", rotation=270, labelpad=18)
+
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(ratio_metrics + [m + " (%)" for m in pct_metrics])
+    ax1.axvline(x=len(ratio_metrics) - 0.5, color="grey", linestyle="--", alpha=0.6)
+
+    handles, labels = ax1.get_legend_handles_labels()
+    ax1.legend(handles, labels, ncol=min(n, 4), frameon=False, loc="upper left")
+
+    ax1.grid(axis="y", linestyle="--", alpha=0.3)
+    plt.title("Strategy Risk/Return Metrics vs Benchmark")
+    plt.tight_layout()
+    plt.show()
+
+    # Return table with % columns already scaled for readability
+    out = df.copy()
+    for col in ["Total_Return", "CAGR", "Alpha", "MaxDD", "Ann_Mean", "Ann_Std_Dev"]:
+        if col in out.columns:
+            out[col] = out[col] * 100.0
+    return out
+
+
+# ==========================================================
+# Function to run entire backtest (+ optional BOTH + internal comparison)
+# ==========================================================
+def run_backtest(start_date, end_date, stock_list, weighted,
+                 lambda_best=0.990, vol_window_best=30, ma_window=50,
+                 use_dual_ma=True, allow_div_near_cross=True,
+                 target_ann_vol=0.20, cost_per_turnover=0.0,
+                 include_attribution=True, plot_results=True,
+                 compare_and_report=False,
+                 benchmark_symbol="SPY", init_cap=500000):
+
+    def _run_variant(weighted_flag: bool):
+        # Run expanding-window backtest
+        yearly_results, stitched_equity, yearly_params = expanding_window_test(
+            stock_list, start_date, end_date, weighted=weighted_flag
+        )
+
+        # Daily Returns and Capital Changes
+        daily = stitched_equity.pct_change().dropna()
+        daily_equity = pd.DataFrame({
+            "Equity": stitched_equity,
+            "Daily_Return": stitched_equity.pct_change()
+        })
+        daily_equity.index.name = "Date"
+        print(f"\n=== Sample of Daily Capital Changes ({'Weighted' if weighted_flag else 'Unweighted'}) ===")
+        print(daily_equity.tail(10))
+
+        # Compute Overall Performance Metrics
+        metrics = calc_metrics(daily, stitched_equity, init_cap=init_cap)
+        alpha, beta, ir, treynor, _ = benchmark_compare(daily, start_date, end_date, symbol=benchmark_symbol)
+        metrics["Volatility"] = daily.std() * np.sqrt(252)
+        metrics["MaxDD_Duration_Days"] = max_drawdown_duration(stitched_equity)
+
+        # Print Summary Metrics
+        variant = "Weighted" if weighted_flag else "Unweighted"
+        final_equity = stitched_equity.iloc[-1]
+
+        print(f"\n{'='*65}")
+        print(f"=== Final Performance Summary for {variant} OBV-EMA Strategy ===")
+        print(f"{'Total Return':22}: {metrics['Total_Return']*100:8.2f} %")
+        print(f"{'CAGR':22}: {metrics['CAGR']*100:8.2f} %")
+        print(f"{'Annual Volatility':22}: {metrics['Volatility']*100:8.2f} %")
+        print(f"{'Sharpe Ratio':22}: {metrics['Sharpe']:10.3f}")
+        print(f"{'Sortino Ratio':22}: {metrics['Sortino']:10.3f}")
+        print(f"{'Calmar Ratio':22}: {metrics['Calmar']:10.3f}")
+        print(f"{'Max Drawdown':22}: {metrics['MaxDD']*100:8.2f} %")
+        print(f"{'Max DD Duration':22}: {metrics['MaxDD_Duration_Days']:10} days")
+        print(f"{'Alpha':22}: {alpha*100:8.2f} %")
+        print(f"{'Beta':22}: {beta:10.3f}")
+        print(f"{'Info Ratio':22}: {ir:10.3f}")
+        print(f"{'Treynor Ratio':22}: {treynor:10.3f}")
+        print(f"{'Final Equity ($)':22}: {final_equity:10,.2f}")
+
+        # Optional Short-Term ROI (last 6 months)
+        if len(stitched_equity) > 252:
+            sub_ret = (stitched_equity.iloc[-125] / stitched_equity.iloc[-252]) - 1
+            print(f"Approx. 6-Month Return before {end_date}: {sub_ret*100:.2f} %")
+
+        # Visualisation: Plot results
+        if plot_results:
+            plot_equity_vs_benchmark(stitched_equity, start_date, end_date, label=f"{variant} OBV-EMA")
+            plot_underwater(stitched_equity)
+            plot_yearly_segments(yearly_results, label="CAGR")
+            performance_dashboard(daily, stitched_equity)
+
+        # Optional Per-Ticker Attribution
+        if include_attribution:
+            bt_full = EMA_OBV_Portfolio(
+                stock_list, start_date, end_date,
+                lambda_=lambda_best, weighted=weighted_flag, vol_window=vol_window_best,
+                ma_window=ma_window, use_dual_ma=use_dual_ma,
+                allow_divergence_near_cross=allow_div_near_cross,
+                target_ann_vol=target_ann_vol, cost_per_turnover=cost_per_turnover
+            )
+            bt_full.run()
+            attr = per_ticker_attribution(bt_full.price, bt_full.positions)
+            print("\n=== Per-Ticker Contribution (table) ===")
+            print(attr.sort_values("Return_Contribution", ascending=False))
+            plot_per_ticker_attribution(bt_full.price, bt_full.positions)
+
+            # Trade Statistics
+            trade_stats = trade_statistics(bt_full.positions, bt_full.price)
+            print("\n=== Trade Statistics Summary ===")
+            for k, v in trade_stats.items():
+                if isinstance(v, (int, np.integer)):
+                    print(f"{k:20}: {v}")
+                else:
+                    print(f"{k:20}: {v*100:.2f} %" if "Rate" in k else f"{k:20}: {v:.4f}")
+            metrics.update(trade_stats)
+
+        return yearly_results, stitched_equity, yearly_params, metrics, daily_equity
+
+    # Run both variants in one call
+    if isinstance(weighted, str) and weighted.lower() == "both":
+        uw_yearly, uw_eq, uw_params, uw_metrics, uw_daily = _run_variant(False)
+        print("\n")
+        w_yearly, w_eq, w_params, w_metrics, w_daily   = _run_variant(True)
+
+        compare_df = None
+        if compare_and_report:
+            compare_df = report_and_compare_performance(
+                strat_equities={
+                    "OBV-EMA (Unweighted)": uw_eq,
+                    "OBV-EMA (Weighted)"  : w_eq
+                },
+                start=start_date, end=end_date,
+                benchmark_symbol=benchmark_symbol, init_cap=init_cap
+            )
+            print("\n=== Strategy vs SPY Performance (%, ratios as-is) ===")
+            print(compare_df.round(3))
+
+        # return a structured dict to keep everything accessible
+        return {
+            "unweighted": {"yearly": uw_yearly, "equity": uw_eq, "params": uw_params, "metrics": uw_metrics, "daily": uw_daily},
+            "weighted":   {"yearly": w_yearly,  "equity": w_eq,  "params": w_params,  "metrics": w_metrics, "daily": w_daily},
+            "compare_df": compare_df
+        }
+
+    # Single-Variant behaviour
+    return _run_variant(bool(weighted))
