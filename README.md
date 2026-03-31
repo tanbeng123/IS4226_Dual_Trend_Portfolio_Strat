@@ -44,7 +44,7 @@ Comprehensive EMA-smoothed On-Balance Volume (OBV) strategy with dual MA confirm
 
 ### 1. Clone & Install
 ```bash
-git clone https://github.com/YOUR_USERNAME/ema-obv-portfolio.git
+git clone https://github.com/tanbeng123/ema-obv-portfolio.git
 cd ema-obv-portfolio
 pip install -r requirements.txt
 ```
@@ -52,7 +52,6 @@ pip install -r requirements.txt
 ### 2. Run Complete Analysis
 ```bash
 jupyter notebook Group2_FinalTerm.ipynb
-# Run all cells → Full dashboard in ~3 minutes
 ```
 
 ### 3. Expected Output
@@ -102,7 +101,6 @@ class EMAOBVPortfolio:
 6. **Trade Analysis** - 392 trades, 51% win rate
 
 ## 🔬 Key Features
-
 - ✅ **Production-grade backtester** (daily equity tracking)
 - ✅ **Out-of-sample validation** (8-year expanding window)
 - ✅ **Comprehensive risk metrics** (15+ measures)
@@ -111,7 +109,6 @@ class EMAOBVPortfolio:
 - ✅ **SPY benchmark comparison** (alpha/beta/IR)
 
 ## 💡 Strategy Advantages
-
 | Feature | Benefit |
 |---------|---------|
 | **Volume precedence** | Early trend detection |
@@ -121,7 +118,6 @@ class EMAOBVPortfolio:
 | **10-stock universe** | Diversification |
 
 ## ⚠️ Limitations & Enhancements
-
 
 ## 📋 Requirements (`requirements.txt`)
 
